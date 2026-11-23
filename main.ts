@@ -5,10 +5,12 @@
 //     their create price, but 526 coins cross +30% with >= 4 distinct buyers,
 //     and those early risers keep running a median +27% more from the crossing.
 //   - So: buy a coin ONCE, small, soon after it proves early momentum with real
-//     buyers behind it, and exit fast on a take-profit, a stop, a trailing stop
-//     or a hold limit. Never chase a coin that already ran far, never re-enter
-//     a coin after an exit, never pyramid. Small size keeps the heavy fees
-//     (125 bps a leg + 105k lamports a tx) survivable and keeps drawdown low.
+//     buyers behind it, while the price still sits near its own high and the
+//     recent tape still nets buy, and exit on a wide take-profit, a tight stop,
+//     a trailing stop (which banks most winners) or a hold limit. Never chase
+//     a coin that already ran far, never re-enter a coin after an exit, never
+//     pyramid. Small size keeps the heavy fees (125 bps a leg + 105k lamports
+//     a tx) survivable and keeps drawdown low.
 //   - The 1%-of-real-reserve buy cap is not binding at this size: at the +30%
 //     crossing the median real SOL reserve is ~7.3 SOL, so a 0.05 SOL buy fits
 //     in a single reply for most coins.
@@ -45,12 +47,13 @@ const MIN_BUYERS = 4;
 const MIN_NET_FLOW_LAMPORTS = 1_000_000_000n;
 /** Real SOL reserve the curve must hold at decision time (lamports). */
 const MIN_REAL_SOL_LAMPORTS = 2_000_000_000n;
-/** Take profit: position value at least this far above its cost (bps). */
-const TP_BPS = 1500;
+/** Take profit: position value at least this far above its cost (bps).
+    Wide on purpose: the trailing stop, not a fixed target, banks winners. */
+const TP_BPS = 4000;
 /** Stop loss: position value at most this far below its cost (bps). */
-const SL_BPS = 1000;
+const SL_BPS = 800;
 /** Trailing stop: sell when value falls this far below its peak (bps). */
-const TRAIL_BPS = 1200;
+const TRAIL_BPS = 1000;
 /** Exit after holding this many slots regardless. */
 const MAX_HOLD_SLOTS = 2000;
 /** Slippage allowed on buys / sells (bps). */
@@ -68,6 +71,11 @@ interface Coin {
   buyers: Set<string>;
   /** Signed SOL lamports bought minus sold by non-creator wallets. */
   netFlow: bigint;
+  /** Highest price seen since the create, as virtual_quote / virtual_token. */
+  highNum: bigint;
+  highDen: bigint;
+  /** Signed SOL lamports of the last 10 non-creator trades (recent flow). */
+  recent: bigint[];
   /** Bought once already (a pending or filled buy). */
   entered: boolean;
   /** Exited already: never re-enter. */
@@ -131,6 +139,9 @@ await runBot({
             trades: 0,
             buyers: new Set(),
             netFlow: 0n,
+            highNum: BigInt(e.virtual_quote_reserves),
+            highDen: BigInt(e.virtual_token_reserves),
+            recent: [],
             entered: false,
             done: false,
             buySlot: -1,
@@ -141,9 +152,18 @@ await runBot({
         const c = coins.get(e.mint);
         if (c === undefined) continue;
         c.trades += 1;
+        // Track the coin's own high: entries must catch momentum still intact,
+        // not a spike that already faded back toward its entry level.
+        if (cmpRatio(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves), c.highNum, c.highDen) > 0) {
+          c.highNum = BigInt(e.virtual_quote_reserves);
+          c.highDen = BigInt(e.virtual_token_reserves);
+        }
         if (e.user !== c.creator) {
           if (e.is_buy) c.buyers.add(e.user);
-          c.netFlow += e.is_buy ? BigInt(e.sol_amount) : -BigInt(e.sol_amount);
+          const signed = e.is_buy ? BigInt(e.sol_amount) : -BigInt(e.sol_amount);
+          c.netFlow += signed;
+          c.recent.push(signed);
+          if (c.recent.length > 10) c.recent.shift();
         }
       } else {
         // CompleteEvent: the curve is over; never enter it again.
@@ -200,6 +220,12 @@ await runBot({
         if (qDen === 0n) continue;
         if (!upAtLeastBps(qNum, qDen, c.createNum, c.createDen, MIN_UP_BPS)) continue;
         if (!upAtMostBps(qNum, qDen, c.createNum, c.createDen, MAX_UP_BPS)) continue;
+        // Momentum still intact: the price must sit within 10% of the coin's
+        // own high, and the last 10 non-creator trades must net buy.
+        if (!upAtLeastBps(qNum, qDen, c.highNum, c.highDen, -1000)) continue;
+        let recentFlow = 0n;
+        for (const f of c.recent) recentFlow += f;
+        if (recentFlow <= 0n) continue;
         const cap = state.maxBuyLamports(c.mint);
         const amount = cap < STAKE_LAMPORTS ? cap : STAKE_LAMPORTS;
         if (amount < MIN_BUY_LAMPORTS) continue;
