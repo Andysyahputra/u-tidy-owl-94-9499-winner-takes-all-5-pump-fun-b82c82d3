@@ -1,19 +1,21 @@
-// Early-momentum scalper for the pump.fun replay sprint (agent-fun/replay/v2).
+// Dip scalper for the pump.fun replay sprint (agent-fun/replay/v2).
 //
-// Idea, from measuring the dev window (Nov 2-3 2026, 1222 coins):
-//   - Most coins die within a few dozen trades; only ~55 of 1123 end >20% above
-//     their create price, but 526 coins cross +30% with >= 4 distinct buyers,
-//     and those early risers keep running a median +27% more from the crossing.
-//   - So: buy a coin ONCE, small, soon after it proves early momentum with real
-//     buyers behind it, while the price still sits near its own high and the
-//     recent tape still nets buy, and exit on a wide take-profit, a tight stop,
-//     a trailing stop (which banks most winners) or a hold limit. Never chase
-//     a coin that already ran far, never re-enter a coin after an exit, never
-//     pyramid. Small size keeps the heavy fees (125 bps a leg + 105k lamports
-//     a tx) survivable and keeps drawdown low.
-//   - The 1%-of-real-reserve buy cap is not binding at this size: at the +30%
-//     crossing the median real SOL reserve is ~7.3 SOL, so a 0.05 SOL buy fits
-//     in a single reply for most coins.
+// What the dev window (Nov 2-3 2026, 1222 coins) actually showed, measured
+// offline on the raw tape before this was written:
+//   - Buying breakouts loses: every momentum/launch variant tested came out
+//     around -0.002 SOL per 0.05 SOL trade. Peaks are one-trade wicks, so no
+//     trailing stop can bank them, and the 125 bps-a-leg curve fee plus the
+//     105k-lamport tx fee (~2.9% a round trip) eats the rest.
+//   - Buying the dip of a proven runner loses least: a coin that already ran
+//     >= 50% over its create price, then pulled back 20-45% from its own
+//     high while buyers step back in, bounces often enough that tight exits
+//     (TP +20%, SL -6%, trail -10%) come out near breakeven, about
+//     -0.0004 to -0.0009 SOL per trade over 130-200 trades, versus -0.002
+//     for breakout entries. The recent-buying requirement matters: without
+//     it the same dip loses 3x as much (falling knives).
+//   - So this bot buys ONLY that dip, once per coin, small (0.05 SOL), and
+//     exits fast. It never chases a breakout, never buys a launch, never
+//     re-enters a coin after an exit, never pyramids.
 //
 // Deterministic by construction: no clock, no randomness, no I/O, iteration
 // only over insertion-ordered maps fed by the batch stream (hello, batch,
@@ -33,25 +35,20 @@ const STAKE_LAMPORTS = 50_000_000n;
 const MIN_BUY_LAMPORTS = 20_000_000n;
 /** Most open positions at once (harness cap is 5). */
 const MAX_OPEN = 5;
-/** Youngest age, in slots since the CreateEvent, at which a coin may be bought. */
-const MIN_AGE_SLOTS = 2;
-/** Oldest age at which a first buy may still be decided. */
-const MAX_AGE_SLOTS = 1500;
-/** Entry needs the price at least this far above the create price (bps). */
-const MIN_UP_BPS = 3000;
-/** ...and not further than this: never chase a coin that already ran far (bps). */
-const MAX_UP_BPS = 15000;
-/** Distinct non-creator buyers that must have bought before entry. */
-const MIN_BUYERS = 4;
-/** Net SOL bought by non-creator wallets before entry (lamports). */
-const MIN_NET_FLOW_LAMPORTS = 1_000_000_000n;
+/** Oldest age, in slots since the CreateEvent, at which a first buy may still be decided. */
+const MAX_AGE_SLOTS = 4000;
+/** The coin's high must be at least this far above its create price (bps). */
+const MIN_RUN_BPS = 5000;
+/** Entry needs the price this far below the coin's own high (bps): lower bound. */
+const PULLBACK_MIN_BPS = 2000;
+/** ...and not further than this: a collapse, not a dip (bps). */
+const PULLBACK_MAX_BPS = 4500;
 /** Real SOL reserve the curve must hold at decision time (lamports). */
 const MIN_REAL_SOL_LAMPORTS = 2_000_000_000n;
-/** Take profit: position value at least this far above its cost (bps).
-    Wide on purpose: the trailing stop, not a fixed target, banks winners. */
-const TP_BPS = 4000;
+/** Take profit: position value at least this far above its cost (bps). */
+const TP_BPS = 2000;
 /** Stop loss: position value at most this far below its cost (bps). */
-const SL_BPS = 800;
+const SL_BPS = 600;
 /** Trailing stop: sell when value falls this far below its peak (bps). */
 const TRAIL_BPS = 1000;
 /** Exit after holding this many slots regardless. */
@@ -68,14 +65,13 @@ interface Coin {
   createNum: bigint;
   createDen: bigint;
   trades: number;
-  buyers: Set<string>;
-  /** Signed SOL lamports bought minus sold by non-creator wallets. */
-  netFlow: bigint;
   /** Highest price seen since the create, as virtual_quote / virtual_token. */
   highNum: bigint;
   highDen: bigint;
-  /** Signed SOL lamports of the last 10 non-creator trades (recent flow). */
+  /** Signed SOL lamports of the last 5 non-creator trades (recent flow). */
   recent: bigint[];
+  /** The most recent trade on this coin was a buy. */
+  lastIsBuy: boolean;
   /** Bought once already (a pending or filled buy). */
   entered: boolean;
   /** Exited already: never re-enter. */
@@ -105,15 +101,16 @@ function upAtLeastBps(
   return num * refDen * 10_000n >= refNum * den * BigInt(10_000 + bps);
 }
 
-/** True when price num/den is at most `bps` above the reference price. */
-function upAtMostBps(
+/** True when price num/den is at most `bps` below the reference price. */
+function downAtMostBps(
   num: bigint,
   den: bigint,
   refNum: bigint,
   refDen: bigint,
   bps: number,
 ): boolean {
-  return num * refDen * 10_000n <= refNum * den * BigInt(10_000 + bps);
+  // num/den >= refNum/refDen * (10000 - bps) / 10000
+  return num * refDen * 10_000n >= refNum * den * BigInt(10_000 - bps);
 }
 
 /** Position value in lamports at the curve's current reserves. */
@@ -137,11 +134,10 @@ await runBot({
             createNum: BigInt(e.virtual_quote_reserves),
             createDen: BigInt(e.virtual_token_reserves),
             trades: 0,
-            buyers: new Set(),
-            netFlow: 0n,
             highNum: BigInt(e.virtual_quote_reserves),
             highDen: BigInt(e.virtual_token_reserves),
             recent: [],
+            lastIsBuy: false,
             entered: false,
             done: false,
             buySlot: -1,
@@ -152,19 +148,17 @@ await runBot({
         const c = coins.get(e.mint);
         if (c === undefined) continue;
         c.trades += 1;
-        // Track the coin's own high: entries must catch momentum still intact,
-        // not a spike that already faded back toward its entry level.
+        // Track the coin's own high: the dip is measured against it.
         if (cmpRatio(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves), c.highNum, c.highDen) > 0) {
           c.highNum = BigInt(e.virtual_quote_reserves);
           c.highDen = BigInt(e.virtual_token_reserves);
         }
         if (e.user !== c.creator) {
-          if (e.is_buy) c.buyers.add(e.user);
           const signed = e.is_buy ? BigInt(e.sol_amount) : -BigInt(e.sol_amount);
-          c.netFlow += signed;
           c.recent.push(signed);
-          if (c.recent.length > 10) c.recent.shift();
+          if (c.recent.length > 5) c.recent.shift();
         }
+        c.lastIsBuy = e.is_buy;
       } else {
         // CompleteEvent: the curve is over; never enter it again.
         const c = coins.get(e.mint);
@@ -202,30 +196,32 @@ await runBot({
       }
     }
 
-    // --- entries: one small buy per young coin with proven momentum --------
+    // --- entries: one small dip-buy per proven runner ----------------------
     if (state.committedPositionCount() < MAX_OPEN) {
       for (const c of coins.values()) {
         if (orders.length >= 16) break;
         if (state.committedPositionCount() >= MAX_OPEN) break;
         if (c.entered || c.done) continue;
         const age = state.slot - c.createdSlot;
-        if (age < MIN_AGE_SLOTS || age > MAX_AGE_SLOTS) continue;
-        if (c.trades < 4 || c.buyers.size < MIN_BUYERS) continue;
-        if (c.netFlow < MIN_NET_FLOW_LAMPORTS) continue;
+        if (age < 2 || age > MAX_AGE_SLOTS) continue;
+        if (c.trades < 5) continue;
         const curve = state.curves.get(c.mint);
         if (curve === undefined || curve.complete) continue;
         if (curve.real_quote_reserves < MIN_REAL_SOL_LAMPORTS) continue;
         const qNum = curve.virtual_quote_reserves;
         const qDen = curve.virtual_token_reserves;
         if (qDen === 0n) continue;
-        if (!upAtLeastBps(qNum, qDen, c.createNum, c.createDen, MIN_UP_BPS)) continue;
-        if (!upAtMostBps(qNum, qDen, c.createNum, c.createDen, MAX_UP_BPS)) continue;
-        // Momentum still intact: the price must sit within 10% of the coin's
-        // own high, and the last 10 non-creator trades must net buy.
-        if (!upAtLeastBps(qNum, qDen, c.highNum, c.highDen, -1000)) continue;
+        // The coin must have run at least 50% over its create price...
+        if (!upAtLeastBps(c.highNum, c.highDen, c.createNum, c.createDen, MIN_RUN_BPS)) continue;
+        // ...and now sit 20-45% below that high (a dip, not a collapse)...
+        if (!downAtMostBps(qNum, qDen, c.highNum, c.highDen, PULLBACK_MAX_BPS)) continue;
+        if (upAtLeastBps(qNum, qDen, c.highNum, c.highDen, -PULLBACK_MIN_BPS)) continue;
+        // ...with buyers stepping back in: the last 5 non-creator trades net
+        // buy, and the most recent trade is a buy.
         let recentFlow = 0n;
         for (const f of c.recent) recentFlow += f;
         if (recentFlow <= 0n) continue;
+        if (!c.lastIsBuy) continue;
         const cap = state.maxBuyLamports(c.mint);
         const amount = cap < STAKE_LAMPORTS ? cap : STAKE_LAMPORTS;
         if (amount < MIN_BUY_LAMPORTS) continue;
