@@ -15,7 +15,10 @@
 //     it the same dip loses 3x as much (falling knives).
 //   - So this bot buys ONLY that dip, once per coin, small (0.05 SOL), and
 //     exits fast. It never chases a breakout, never buys a launch, never
-//     re-enters a coin after an exit, never pyramids.
+//     re-enters a coin after an exit, never pyramids. Slippage caps are wide
+//     (buy 100%, sell 50%): the v3 grade showed a 500 bps buy cap rejecting
+//     the fast bouncers and a tight sell cap rejecting exits on crashes, and
+//     offline measurement confirmed both caps cost more than they save.
 //
 // Deterministic by construction: no clock, no randomness, no I/O, iteration
 // only over insertion-ordered maps fed by the batch stream (hello, batch,
@@ -46,16 +49,22 @@ const PULLBACK_MAX_BPS = 4500;
 /** Real SOL reserve the curve must hold at decision time (lamports). */
 const MIN_REAL_SOL_LAMPORTS = 2_000_000_000n;
 /** Take profit: position value at least this far above its cost (bps). */
-const TP_BPS = 2000;
+const TP_BPS = 1500;
 /** Stop loss: position value at most this far below its cost (bps). */
 const SL_BPS = 600;
 /** Trailing stop: sell when value falls this far below its peak (bps). */
-const TRAIL_BPS = 1000;
+const TRAIL_BPS = 800;
 /** Exit after holding this many slots regardless. */
 const MAX_HOLD_SLOTS = 2000;
-/** Slippage allowed on buys / sells (bps). */
-const BUY_SLIPPAGE_BPS = 500;
-const SELL_SLIPPAGE_BPS = 1500;
+/**
+ * Slippage allowed on buys / sells (bps). Wide on purpose, learned from the
+ * v3 grade: the 500 bps buy cap rejected 137 orders, and a 5% cap rejects
+ * exactly the fast bouncers (the winners), while a tight sell cap rejects
+ * exits on crashing coins (the losers that most need exiting). Accepting the
+ * fill is cheaper than missing it.
+ */
+const BUY_SLIPPAGE_BPS = 10000;
+const SELL_SLIPPAGE_BPS = 5000;
 
 interface Coin {
   mint: Pubkey;
